@@ -1,29 +1,18 @@
-package at.cosylab.fog.ccaa.utils.fti_agent;
+package at.cosylab.fog.faca.commons.fti_agent;
 
-import at.cosylab.fog.ccaa.utils.ConnectivityEngineGlobals;
-import at.cosylab.fog.ccaa.utils.amqp.FogAMQPClient;
-import at.cosylab.fog.ccaa.utils.cloud.CloudBackendHTTPClientService;
-import at.cosylab.fog.ccaa.utils.pki.KeyStoreClient;
-import at.cosylab.fog.ccaa.utils.repositories.configuration_attribute.ConfigurationAttribute;
-import at.cosylab.fog.ccaa.utils.repositories.configuration_attribute.ConfigurationAttributeRepository;
-import context.amqp.ContextAMQPRoutingConstants;
-import context.attributes.AttributeNameGenerator;
-import context.attributes.ContextAttributeConfidenceRange;
-import context.attributes.ContextDistributionPattern;
-import context.attributes.ContextType;
-import context.payloads.ContextAttributeConfiguration;
-import context.payloads.RegisterCAAttributesRequest;
+import at.cosylab.fog.faca.commons.FACAGlobals;
+import at.cosylab.fog.faca.commons.cloud.CloudBackendHTTPClientService;
+import at.cosylab.fog.faca.commons.fog_amqp.FogAMQPClient;
+import at.cosylab.fog.faca.commons.pki.KeyStoreClient;
+import at.cosylab.fog.faca.commons.repositories.configuration_attribute.ConfigurationAttribute;
+import at.cosylab.fog.faca.commons.repositories.configuration_attribute.ConfigurationAttributeRepository;
 import fog.amqp_utils.routes.FTARoutesConstants;
-import fog.error_handling.amqp_exceptions.AMQPMessageParsingException;
-import fog.error_handling.global_exceptions.InternalServerErrorException;
-import fog.faca.access_rules.AccessRuleType;
-import fog.globals.payloads.ServiceProcessingResponse;
 import fog.payloads.fta.CertificateValidationHolder;
 import fog.payloads.fta.FogComponentCSR;
 import identities.FogServiceType;
 import identities.IdentityGenerator;
+import jws.JWSTokenHandler;
 import lombok.Getter;
-import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,9 +36,9 @@ import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 
 @Configuration
-public class FirstTimeInstallationHandler {
+public class CryptoInstallationHandler {
 
-    private static final Logger logger = LoggerFactory.getLogger(FirstTimeInstallationHandler.class);
+    private static final Logger logger = LoggerFactory.getLogger(CryptoInstallationHandler.class);
 
     @Autowired
     private FogAMQPClient fogAmqpClient;
@@ -60,13 +49,13 @@ public class FirstTimeInstallationHandler {
     @Autowired
     private CloudBackendHTTPClientService cloudClient;
 
-    @Value("${cosylab.ccaa.keystore.filename}")
+    @Value("${cosylab.faca.keystore.filename}")
     private String keystoreFilename;
 
-    @Value("${cosylab.ccaa.keystore.password}")
+    @Value("${cosylab.faca.keystore.password}")
     private String keystorePassword;
 
-    @Value("${cosylab.ccaa.certificate.tnta.filename}")
+    @Value("${cosylab.faca.certificate.tnta.filename}")
     private String tntaCertFilename;
 
     private KeyStoreClient keyStoreClient;
@@ -74,13 +63,15 @@ public class FirstTimeInstallationHandler {
     private Provider bcProvider;
 
     @Getter
+    private String identity;
+    @Getter
     private PrivateKey myPrivateKey;
     @Getter
     private X509Certificate myCert;
-    @Getter
-    private String identity;
 
     private X509Certificate tntaCert;
+    @Getter
+    private JWSTokenHandler jwsHandler;
 
     @PostConstruct
     public void init() throws NoSuchAlgorithmException, NoSuchProviderException, IOException, CertificateException, UnrecoverableKeyException, KeyStoreException {
@@ -91,55 +82,26 @@ public class FirstTimeInstallationHandler {
         FileReader keyReader = new FileReader(tntaCertFilename);
         this.tntaCert = CertificateKeyConverter.convertPEMToX509(keyReader);
 
-        ConfigurationAttribute configAttr = configAttrRepo.findByName(ConnectivityEngineGlobals.FTI_FLAG_DB_KEY);
-        if (configAttr == null) {
-            configAttr = new ConfigurationAttribute(ConnectivityEngineGlobals.FTI_FLAG_DB_KEY, Boolean.toString(false));
-        }
-        if (configAttr.getValue().equals(Boolean.toString(false))) {
-            try {
-                this.executeFTIProcedure();
-                configAttr.setValue(Boolean.toString(true));
-                configAttrRepo.save(configAttr);
-            } catch (AMQPMessageParsingException e) {
-                configAttrRepo.save(configAttr);
-                e.printStackTrace();
-            }
-        }
-    }
-
-    private void executeFTIProcedure() throws NoSuchAlgorithmException, IOException, CertificateException, UnrecoverableKeyException, KeyStoreException {
-
         this.initTrustInFog();
 
-        ContextAttributeConfiguration connectivityAttribute = new ContextAttributeConfiguration(
-                AttributeNameGenerator.generateContextAttributeName(ContextType.CONNECTIVITY, ConnectivityEngineGlobals.CONNECTIVITY_ATTRIBUTE_NAME),
-                ContextType.CONNECTIVITY, AccessRuleType.BOOLEAN, null, ContextDistributionPattern.PERIODIC,
-                ConnectivityEngineGlobals.CONNECTIVITY_CHECK_PERIOD_SECONDS, ConnectivityEngineGlobals.CONNECTIVITY_ATTR_VALUE_EXPIRATION_SECONDS, new ContextAttributeConfidenceRange(ConnectivityEngineGlobals.MIN_CERTAINTY, ConnectivityEngineGlobals.MAX_CERTAINTY),
-                ConnectivityEngineGlobals.ATTR_EVAL_QUEUE_NAME);
-
-        logger.info(connectivityAttribute.toString());
-
-        fogAmqpClient.sendAndReceiveContextAMQPRequest(ContextAMQPRoutingConstants.FACA_REGISTER_ATTRIBUTES, new RegisterCAAttributesRequest(connectivityAttribute), ServiceProcessingResponse.class);
-
-        logger.info("FTI to FACA was successful");
+        this.jwsHandler = new JWSTokenHandler(this.myCert.getPublicKey(), this.myPrivateKey, this.identity);
 
     }
 
-    private void initTrustInFog() throws NoSuchAlgorithmException, IOException, CertificateException, KeyStoreException, UnrecoverableKeyException {
-
+    private void initTrustInFog() throws NoSuchAlgorithmException, KeyStoreException, UnrecoverableKeyException, IOException, CertificateException {
 
         int iterCounter = 1;
         this.myPrivateKey = keyStoreClient.loadMyPrivateKey();
-        ConfigurationAttribute idAttr = configAttrRepo.findByName(ConnectivityEngineGlobals.CCAA_IDENTITY_KEY);
-        ConfigurationAttribute certAttr = configAttrRepo.findByName(ConnectivityEngineGlobals.CCAA_CERTIFICATE_KEY);
+        ConfigurationAttribute idAttr = configAttrRepo.findByName(FACAGlobals.FACA_IDENTITY_KEY);
+        ConfigurationAttribute certAttr = configAttrRepo.findByName(FACAGlobals.FACA_CERTIFICATE_KEY);
 
 
         if ((this.myPrivateKey == null) || (certAttr == null) || (idAttr == null)) {
             this.myPrivateKey = null;
             idAttr = null;
             certAttr = null;
-            configAttrRepo.deleteByName(ConnectivityEngineGlobals.CCAA_IDENTITY_KEY);
-            configAttrRepo.deleteByName(ConnectivityEngineGlobals.CCAA_CERTIFICATE_KEY);
+            configAttrRepo.deleteByName(FACAGlobals.FACA_IDENTITY_KEY);
+            configAttrRepo.deleteByName(FACAGlobals.FACA_CERTIFICATE_KEY);
             while ((iterCounter < 10 && ((this.myPrivateKey == null) || (certAttr == null) || (idAttr == null)))) {
                 try {
                     // generate public key
@@ -182,14 +144,14 @@ public class FirstTimeInstallationHandler {
                             this.myCert);
 
                     if (idAttr == null) {
-                        idAttr = new ConfigurationAttribute(ConnectivityEngineGlobals.CCAA_IDENTITY_KEY, identity);
+                        idAttr = new ConfigurationAttribute(FACAGlobals.FACA_IDENTITY_KEY, identity);
                     } else {
                         idAttr.setValue(identity);
                     }
                     configAttrRepo.save(idAttr);
 
                     if (certAttr == null) {
-                        certAttr = new ConfigurationAttribute(ConnectivityEngineGlobals.CCAA_CERTIFICATE_KEY, respCert.getCertificateContent());
+                        certAttr = new ConfigurationAttribute(FACAGlobals.FACA_CERTIFICATE_KEY, respCert.getCertificateContent());
                     } else {
                         certAttr.setValue(respCert.getCertificateContent());
                     }
@@ -211,4 +173,5 @@ public class FirstTimeInstallationHandler {
             logger.info("Fog Trust init successful");
         }
     }
+
 }
